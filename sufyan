@@ -1,0 +1,411 @@
+Hypothesis Review: Metric Computation Is a Material Driver of Model Plan Runtime
+
+Executive Summary
+
+Hypothesis under review
+
+> Reducing the number of metrics will not materially improve Model Plan runtime because the dominant cost is reading, scanning and parsing the underlying CSV data.
+
+Based on the Spark execution evidence and controlled metric-only experiments completed to date, this hypothesis is not supported by the observed behaviour.
+
+CSV scanning and parsing is an unavoidable fixed cost. However, the evidence shows that a significant proportion of execution time occurs after the source data has already been read, within downstream shuffle, grouping, aggregation and metric-processing stages.
+
+More importantly, when the same input dataset and same Spark job profile were used with different metric populations, runtime changed materially:
+
+|Run|Metrics Executed|% of 356 Metrics|Runtime   |Reduction vs 239-Metric Run|
+|---|---------------:|---------------:|---------:|--------------------------:|
+|M67|239             |~67%            |**4h 13m**|Baseline                   |
+|M41|148             |~41%            |**2h 28m**|**~42% faster**            |
+|M25|91              |~25%            |**1h 57m**|**~54% faster**            |
+
+The input dataset remained unchanged.
+
+This provides direct evidence that metric workload is a material component of runtime, independently of the fixed source-read cost.
+
+The optimisation direction should therefore include metric rationalisation, specifically identifying and removing unused, duplicated or low-value metrics while preserving required model behaviour.
+
+────────
+
+1. Hypothesis Being Tested
+
+The original position was:
+
+> CSV is row-based and must be scanned and parsed regardless of how many metrics are calculated. Therefore, removing metrics will save relatively little because the dominant cost is the fixed I/O and parsing overhead.
+
+There are two parts to this statement.
+
+The first part is valid:
+
+> **The underlying data still has to be read.**
+
+Reducing the number of metrics does not eliminate the requirement to load the relevant source dataset.
+
+The second part does not follow automatically:
+
+> **Because the data must still be read, metric computation must therefore be a negligible component of total runtime.**
+
+The current Spark evidence demonstrates that this second assumption is not valid for this workload.
+
+────────
+
+2. Full 100% Model Plan Execution Evidence
+
+The 100% base Model Plan provides a useful breakdown of where execution time is actually being spent.
+
+|Stage                          |Approx. Wall-Clock|Key Activity Observed                                                   |
+|-------------------------------|-----------------:|------------------------------------------------------------------------|
+|Stage 0                        |**4.0h**          |`DataReaderRDD`, multiple transformations, preparation for first shuffle|
+|Stage 1                        |**3.1h**          |Reads first shuffle, processes/group data, writes second shuffle        |
+|Stage 2                        |**5.6h**          |Reads second shuffle and performs extensive downstream processing       |
+|**Total major-stage execution**|**~12.7h**        |                                                                        |
+
+Approximately:
+
+• 31% of the main-stage execution is in Stage 0.
+• 69% occurs in Stage 1 and Stage 2, after the source-reading stage.
+
+This matters because Stage 0 itself is not purely CSV reading.
+
+────────
+
+3. Stage 0 Is Not Equivalent to “CSV Read Time”
+
+Stage 0 begins from:
+
+DataReaderRDD [0]
+
+This confirms that the source data enters Spark during this stage.
+
+However, the DAG then contains a long sequence of MapPartitionsRDD transformations before the first shuffle boundary.
+
+Stage 0 therefore includes:
+
+CSV/file access -> parsing/deserialisation -> initial transformations -> MapPartitions processing -> preparation for redistribution -> shuffle generation
+
+The stage writes approximately:
+
+• 1,156.9 GiB of shuffle data
+• across approximately 1.279 billion records
+
+before Stage 1 begins.
+
+Therefore, even attributing the entire 4 hours of Stage 0 to CSV scanning would substantially overestimate the actual CSV-only cost.
+
+At most, the read/parse cost is contained within that four-hour stage.
+
+It is not equivalent to four hours of pure CSV I/O.
+
+────────
+
+4. The Majority of Runtime Occurs After the Initial Read
+
+Stage 1 begins from:
+
+ShuffledRDD [21]
+
+It is no longer reading the original CSV.
+
+Stage 1 processes:
+
+• 1,108.7 GiB shuffle read
+• 1,813.5 GiB shuffle write
+
+with:
+
+|Stage 1 Metric|Result  |
+|--------------|-------:|
+|Runtime       |~3.1h   |
+|Median task   |6.9m    |
+|Maximum task  |1.1h    |
+|Memory spill  |4.5 GiB |
+|Disk spill    |88.2 MiB|
+
+This is distributed processing cost after the input data has already entered the Spark execution pipeline.
+
+────────
+
+5. Stage 2 Shows That the Main Constraint Cannot Be Explained by CSV Alone
+
+Stage 2 begins from:
+
+ShuffledRDD [25]
+
+Again, the original CSV is not being read at this point.
+
+Stage 2 consumes approximately:
+
+1,873.6 GiB of shuffled intermediate data
+
+and then executes a long chain of MapPartitionsRDD operations.
+
+Its performance characteristics are:
+
+|Stage 2 Metric       |Result         |
+|---------------------|--------------:|
+|Stage runtime        |**5.6h**       |
+|Shuffle read         |**1,873.6 GiB**|
+|Memory spill         |**203.4 GiB**  |
+|Disk spill           |**16.9 GiB**   |
+|Median task duration |**6.8m**       |
+|Maximum task duration|**4.8h**       |
+|Median shuffle/task  |**94.6 MiB**   |
+|Maximum shuffle/task |**5.1 GiB**    |
+
+Stage 2 alone consumes more wall-clock time than Stage 0.
+
+A typical task takes approximately 6.8 minutes, while the slowest task runs for approximately 4.8 hours.
+
+Likewise, a typical task receives roughly 95 MiB of shuffle data, while the largest receives approximately 5.1 GiB.
+
+This processing happens after the source data has already been read.
+
+It therefore cannot be explained as CSV scan/parse overhead.
+
+────────
+
+6. Metric-Only Benchmark Provides Direct Evidence
+
+The strongest evidence comes from the metric-only experiments.
+
+All benchmark runs used:
+
+• Same input dataset: ETL_90D_Data_260328_260702
+• Same job profile: SK-mig12-MF06
+• Same Spark execution environment
+
+The major variable changed was the metric population.
+
+Results
+
+|Run|Metrics Population|Metric Count|Runtime   |
+|---|-----------------:|-----------:|---------:|
+|M25|~25%              |91          |**1h 57m**|
+|M41|~41%              |148         |**2h 28m**|
+|M67|~67%              |239         |**4h 13m**|
+
+This behaviour is inconsistent with the assumption that runtime is predominantly controlled by fixed input scanning.
+
+If CSV parsing dominated the execution cost, the three runtimes should remain relatively close because every run incurs the same source-read overhead.
+
+Instead:
+
+• 91 metrics -> 1h 57m
+• 148 metrics -> 2h 28m
+• 239 metrics -> 4h 13m
+
+Runtime rises materially as the metric workload increases.
+
+────────
+
+7. Metric Composition Also Matters
+
+The earlier 100% Test A and Test B runs reinforce this.
+
+Both tests executed six metric operators against the same underlying data.
+
+However:
+
+|               |Test A     |Test B     |
+|---------------|----------:|----------:|
+|Stage 0        |~11m       |~11m       |
+|Stage 1        |~2.1h      |~49m       |
+|Stage 2        |~2.0h      |~1.2h      |
+|Approx. overall|**~4h 13m**|**~2h 11m**|
+
+The source/input stage is essentially identical.
+
+The downstream execution is not.
+
+This shows that which metrics are executed materially changes the cost of processing even where the source-read cost remains effectively constant.
+
+This also demonstrates that metric cost is not simply proportional to the number of metrics. Different metric definitions have different computational characteristics.
+
+────────
+
+8. Why Metric Computation Is More Than “A Few Calculations”
+
+The original argument implicitly treats metric execution as:
+
+Read CSV -> calculate several values
+
+That does not accurately describe the workload.
+
+The metric operators contain calculations involving combinations of:
+
+• customer_id
+• receiver/account identifiers
+• device/IP fields
+• session identifiers
+• payment type
+• channel
+
+with windows including:
+
+• 1 hour
+• 7 days
+• 15 days
+• 30 days
+• 60 days
+• 90 days
+
+and aggregations such as:
+
+• count
+• count distinct
+• sum
+• average
+• minimum / maximum
+• standard deviation
+• first / last
+
+These operations can require Spark to:
+
+• group records
+• redistribute records between executors
+• sort data
+• maintain aggregation state
+• create shuffle files
+• transfer data across the network
+• hold intermediate structures in memory
+• spill intermediate state to disk when memory pressure rises
+• re-read spilled data
+• merge partial results
+
+Therefore, removing an expensive metric does not simply remove a small arithmetic calculation.
+
+It can potentially reduce the amount of grouping, shuffle, memory utilisation, disk spill and downstream processing generated by the plan.
+
+────────
+
+9. Relationship With the Memory Fraction Finding
+
+This is also consistent with the earlier spark.memory.fraction = 0.6 experiment.
+
+Increasing the memory fraction gave Spark a larger working area for:
+
+• sorting
+• aggregation
+• grouping
+• shuffle processing
+• intermediate execution state
+
+This produced approximately a 7-8% performance improvement and improved behaviour under contention.
+
+That experiment showed:
+
+> **Memory pressure and downstream execution processing are material to this workload.**
+
+The metric experiments now show:
+
+> **Metric workload is one of the sources of that downstream processing pressure.**
+
+These findings are complementary.
+
+The memory change improves how efficiently Spark processes the workload.
+
+Metric rationalisation reduces how much workload Spark has to process in the first place.
+
+────────
+
+10. What the Current Evidence Supports
+
+The current evidence supports the following conclusion:
+
+> **CSV scanning and parsing represents a fixed execution cost, but it is not sufficient to explain the total Model Plan runtime. A substantial amount of processing occurs downstream of the initial data-read stage, and controlled metric-only testing demonstrates that reducing and changing the metric population can materially reduce execution time despite the input dataset remaining unchanged.**
+
+The evidence therefore rejects the hypothesis:
+
+> **“Metric reduction cannot materially improve runtime because CSV scanning dominates execution.”**
+
+What has not yet been established is the precise runtime saving that would be achieved by removing unused metrics from the final production-equivalent Model Plan.
+
+That requires a final end-to-end benchmark.
+
+────────
+
+11. Recommended Optimisation Direction
+
+The optimisation strategy should now focus on metric rationalisation, rather than treating the entire metric population as fixed.
+
+The objective should not be to indiscriminately remove metrics.
+
+Metrics should be classified as:
+
+|Classification                           |Action                         |
+|-----------------------------------------|-------------------------------|
+|Required and valuable                    |Retain                         |
+|Unused downstream                        |Candidate for removal          |
+|Duplicate / redundant                    |Consolidate or remove          |
+|Low-value model feature                  |Data Science review            |
+|High computational cost / low model value|Priority optimisation candidate|
+
+The current benchmark page identifies 356 metric definitions across 12 metric operators.
+
+If a broader feature count such as ~731 is used elsewhere, it should be kept separate from the 356 metric-definition count unless confirmed to represent the same population.
+
+────────
+
+12. Final Validation Experiment
+
+The next end-to-end test should compare:
+
+|Test                 |Configuration                                                         |
+|---------------------|----------------------------------------------------------------------|
+|**Full Baseline**    |Current complete Model Plan                                           |
+|**Lean Metrics Plan**|Same Model Plan with a materially reduced, validated metric population|
+
+Both tests must use:
+
+• same 100% source dataset
+• same SK-mig12-MF06 profile
+• same 20K partition configuration
+• same cluster
+• same source path
+• same output path/type where possible
+• no concurrent workload
+
+The comparison should measure:
+
+• overall runtime
+• Stage 0 / Stage 1 / Stage 2 runtime
+• shuffle read / write
+• memory spill
+• disk spill
+• median / maximum task duration
+• throughput
+
+The important expectation is not that CSV scanning disappears.
+
+It will not.
+
+The hypothesis being tested is:
+
+> **Does reducing the metric workload substantially reduce the downstream processing that occurs after the fixed source-read cost?**
+
+The metric-only benchmarks already indicate that it does.
+
+────────
+
+Conclusion
+
+The evidence currently points to two distinct runtime components.
+
+Fixed cost
+
+The Model Plan must read and parse the underlying source data.
+
+Variable cost
+
+The plan must then group, shuffle, aggregate and calculate the configured metrics.
+
+The fixed cost remains regardless of metric count.
+
+However, the variable cost changes substantially depending on the metric workload.
+
+The controlled experiments show that reducing the metric population from 239 to 148 reduced metric-plan runtime by approximately 42%, while reducing it to 91 metrics reduced runtime by approximately 54%, despite using the same source dataset and Spark profile.
+
+Therefore:
+
+> **The presence of unavoidable CSV scan/parse overhead is not a valid reason to dismiss metric rationalisation as a performance optimisation.**
+
+The current evidence indicates that reducing unnecessary metric computation should be a primary optimisation workstream for achieving a lower and more sustainable Model Plan runtime, alongside continued Spark/platform optimisation.
