@@ -1,418 +1,102 @@
-Metric Operator Breakdown: Individual Metric-Only Benchmark Findings
+Then I’d simplify the wording further and make Data Science the single owner of both sides: model value and computational cost.
 
-Executive Summary
+Data Science Ask: Feature Rationalisation
 
-This page documents the individual metric-operator benchmarks completed against the 100% prepared datasource using the current known-good execution baseline.
+Why we need this
 
-Scope
+The current Model Plan has:
 
-These are metric-only runs.
+* 763 original features
+* 29 removed
+* 734 features remaining
 
-They do not include the upstream Map operators from the full Model Plan. The purpose of the exercise is therefore to understand performance inside the Metrics layer, not to attribute a percentage of total end-to-end Model Plan runtime to any individual operator.
+Our testing shows that feature computation is a material part of runtime.
 
-Test baseline
+We have also found that feature cost is not equal. Some operators create much more shuffle, spill and long-running tasks than others.
 
-• Same prepared 100% datasource
-• Same Spark / Dataproc environment
-• Same SK-mig12-MF06 job profile
-• Manual partitioning at 20,000
-• spark.memory.fraction = 0.6
-• Runs executed individually rather than concurrently
+The goal is not to remove an arbitrary number of features.
 
-Main findings
+The goal is:
 
-1. gen_metric_1 is the most expensive operator in the tested group.
-2. Five of the six operators independently generate a second, shuffle-heavy Stage 2 with substantial spill and long-running straggler tasks.
-3. fv4_metric_8 is the clear exception. It completes after one downstream stage and avoids the heavy second-stage spill pattern.
-4. Metric count alone does not explain runtime. Metric design and execution shape are more important.
-5. The recurring expensive pattern points toward the underlying metric definitions, including Group By keys, windows, aggregation type and resulting partition distribution, rather than simply the number of metrics configured.
-6. Several runs experienced INTERNAL_ERROR_NETWORK on Stage 1 before successful retry. Successful-stage metrics are still useful for operator comparison, but end-to-end elapsed time should be treated as slightly contaminated by infrastructure instability.
+Identify which of the 734 features are genuinely needed, which are expensive, and which can be safely removed or simplified without materially impacting fraud/model performance.
 
-────────
+What we need Data Science to do
 
-1. Individual Operator Results
+For each current feature, assess both:
 
-|Operator        |Metric Count|Approx. Runtime|Stage 1   |Stage 2   |Final Shuffle Read|Final Memory Spill|Final Disk Spill|Final Median Task|Final Max Task|
-|----------------|-----------:|--------------:|---------:|---------:|-----------------:|-----------------:|---------------:|----------------:|-------------:|
-|`gen_metric_1`  |78          |**~105 min**   |**50 min**|**45 min**|**1,372.9 GiB**   |**151.5 GiB**     |**10.4 GiB**    |51 sec           |**39 min**    |
-|`gen_metric_2`  |58          |~90 min        |35 min    |42 min    |1,256.4 GiB       |148.7 GiB         |9.6 GiB         |56 sec           |36 min        |
-|`fv2_metric_6`  |44          |~79 min        |21 min    |41 min    |1,345.0 GiB       |148.3 GiB         |10.3 GiB        |49 sec           |36 min        |
-|`frdrt_metric_7`|22          |~71 min        |13 min    |**44 min**|1,213.2 GiB       |127.6 GiB         |7.9 GiB         |60 sec           |38 min        |
-|`gen_metric_3`  |12          |~61 min        |7 min     |38 min    |1,204.5 GiB       |124.4 GiB         |7.4 GiB         |45 sec           |33 min        |
-|`fv4_metric_8`  |25          |**~40 min**    |29 min    |**None**  |1,144.3 GiB       |**4.4 GiB**       |**94.7 MiB**    |1.2 min          |14 min        |
+1. Model value
+    * Is it used by the current model?
+    * How important is it?
+    * Is it duplicated, strongly correlated or redundant?
+    * Can it be removed safely?
+2. Computational cost
+    * Which operator generates it?
+    * Is it part of one of the expensive metric operators?
+    * Does it use costly grouping, long windows or aggregations?
+    * Is it contributing to heavy shuffle, spill or long-running tasks?
 
-> **Important:** Approximate runtime includes retry overhead where Stage 1 experienced `INTERNAL_ERROR_NETWORK`. Stage-level successful-attempt metrics are the stronger comparison for computational behaviour.
+A simple classification is enough:
 
-────────
+Category	Action
+High value / required	Keep
+Unused	Remove candidate
+Duplicate / redundant	Remove or consolidate
+Low model value	Review for removal
+High value but expensive	Keep, but review implementation
+Low value and expensive	Highest priority to remove
 
-2. Stage 0 Is Broadly Consistent Across Operators
+What we have found
 
-Stage 0 is relatively similar across the individual metric-only runs.
+Our individual metric testing shows large differences in cost:
 
-Typical observations:
+Operator	Metrics	Approx. runtime
+gen_metric_1	78	~105 min
+gen_metric_2	58	~90 min
+fv2_metric_6	44	~79 min
+frdrt_metric_7	22	~71 min
+gen_metric_3	12	~61 min
+fv4_metric_8	25	~40 min
 
-• Stage 0 duration: approximately 8–12 minutes
-• Stage 0 shuffle write: approximately 1.15–1.17 TiB
-• Stage 0 median task duration: around 0.2 seconds
-• Stage 0 execution memory: approximately 64 MiB median
+This shows that metric count alone does not determine cost.
 
-This consistency is important.
+Some small metric groups are still expensive, so the review needs to focus on which features are costly and whether they are actually worth keeping.
 
-The large runtime differences between operators are not primarily being created in Stage 0.
+Output we need
 
-The major divergence appears after the first shuffle boundary, in Stage 1 and, for five operators, Stage 2.
+A simple table:
 
-This supports the conclusion that the operator-specific cost is being introduced by the downstream metric-processing path.
+Feature	Operator	Used by model?	Importance	Computational cost	Remove?
+Feature A	gen_metric_1	Yes	High	High	No
+Feature B	gen_metric_1	No	None	High	Yes
+Feature C	Map operator	Yes	Low	Medium	Review
 
-────────
+From that, we want three lists:
 
-3. gen_metric_1 Is the Heaviest Tested Operator
+* Safe to remove
+* Needs review
+* Must retain
 
-Configuration size
+What happens next
 
-gen_metric_1 contains 78 metrics, the largest population in this six-operator group.
+Data Science then creates a lean Model Plan using the approved feature set.
 
-Observed execution
+We run that against the current 734-feature plan using the same:
 
-• Approximate runtime: ~105 minutes
-• Stage 1: 50 minutes
-• Stage 2: 45 minutes
-• Stage 1 shuffle read: 1,123.1 GiB
-• Stage 1 shuffle write: 1,347.0 GiB
-• Stage 2 shuffle read: 1,372.9 GiB
-• Stage 2 memory spill: 151.5 GiB
-• Stage 2 disk spill: 10.4 GiB
-• Stage 2 median task: 51 seconds
-• Stage 2 maximum task: 39 minutes
-• Stage 2 median shuffle read: 69.4 MiB
-• Stage 2 maximum shuffle read: 3.3 GiB
+* 100% dataset
+* MF06 profile
+* 20K partitioning
+* Spark configuration
 
-Interpretation
+Then compare:
 
-gen_metric_1 is expensive across both downstream stages.
+* total runtime
+* shuffle
+* spill
+* long-running tasks
+* model performance
 
-It has the longest Stage 1 and the highest final-stage shuffle and spill figures of the six tested operators.
+Main ask
 
-This makes gen_metric_1 the first operator that should be reviewed in detail by Engineering / Data Science.
+Review the 734 current features and identify which are required, which are low-value or redundant, which are computationally expensive, and which can be safely removed or simplified.
 
-However, it should not be treated as the only problem because the same expensive Stage 2 pattern appears independently in several other operators.
-
-────────
-
-4. gen_metric_2
-
-Configuration size
-
-gen_metric_2 contains 58 metrics.
-
-Observed execution
-
-• Approximate runtime: ~90 minutes
-• Stage 1: 35 minutes
-• Stage 2: 42 minutes
-• Stage 1 shuffle read: 1,111.6 GiB
-• Stage 1 shuffle write: 1,220.3 GiB
-• Stage 2 shuffle read: 1,256.4 GiB
-• Stage 2 memory spill: 148.7 GiB
-• Stage 2 disk spill: 9.6 GiB
-• Stage 2 median task: 56 seconds
-• Stage 2 maximum task: 36 minutes
-• Stage 2 median shuffle read: 63.6 MiB
-• Stage 2 maximum shuffle read: 3.0 GiB
-
-Interpretation
-
-gen_metric_2 is the second-heaviest operator by overall elapsed runtime.
-
-The cost is split across both Stage 1 and Stage 2, with a substantial second shuffle and almost 149 GiB of memory spill in Stage 2.
-
-────────
-
-5. fv2_metric_6
-
-Configuration size
-
-fv2_metric_6 contains 44 metrics.
-
-Observed execution
-
-• Approximate runtime: ~79 minutes
-• Stage 1: 21 minutes
-• Stage 2: 41 minutes
-• Stage 1 shuffle read: 968.8 GiB
-• Stage 1 shuffle write: 1,138.5 GiB
-• Stage 2 shuffle read: 1,345.0 GiB
-• Stage 2 memory spill: 148.3 GiB
-• Stage 2 disk spill: 10.3 GiB
-• Stage 2 median task: 49 seconds
-• Stage 2 maximum task: 36 minutes
-• Stage 2 median shuffle read: 68 MiB
-• Stage 2 maximum shuffle read: 3.2 GiB
-
-Interpretation
-
-fv2_metric_6 generates the second-highest final-stage shuffle read and a very similar spill profile to gen_metric_1 and gen_metric_2.
-
-Its Stage 1 is materially lighter than the two gen_metric operators, but its Stage 2 remains expensive.
-
-────────
-
-6. frdrt_metric_7
-
-Configuration size
-
-frdrt_metric_7 contains 22 metrics.
-
-Observed execution
-
-• Approximate runtime: ~71 minutes
-• Stage 1: 13 minutes
-• Stage 2: 44 minutes
-• Stage 1 shuffle read: 1,086.6 GiB
-• Stage 1 shuffle write: 1,152.4 GiB
-• Stage 2 shuffle read: 1,213.2 GiB
-• Stage 2 memory spill: 127.6 GiB
-• Stage 2 disk spill: 7.9 GiB
-• Stage 2 median task: 60 seconds
-• Stage 2 maximum task: 38 minutes
-• Stage 2 median shuffle read: 61.4 MiB
-• Stage 2 maximum shuffle read: 2.7 GiB
-
-Interpretation
-
-This operator is important because it shows that metric count does not determine computational cost.
-
-With only 22 metrics, frdrt_metric_7 still creates a 44-minute Stage 2, which is longer than the Stage 2 of several much larger metric operators.
-
-This strongly suggests that the structure of the metric definitions is more important than the count alone.
-
-────────
-
-7. gen_metric_3
-
-Configuration size
-
-gen_metric_3 contains only 12 metrics.
-
-Observed execution
-
-• Approximate runtime: ~61 minutes
-• Stage 1: 7 minutes
-• Stage 2: 38 minutes
-• Stage 1 shuffle read: 795.2 GiB
-• Stage 1 shuffle write: 837.5 GiB
-• Stage 2 shuffle read: 1,204.5 GiB
-• Stage 2 memory spill: 124.4 GiB
-• Stage 2 disk spill: 7.4 GiB
-• Stage 2 median task: 45 seconds
-• Stage 2 maximum task: 33 minutes
-• Stage 2 median shuffle read: 61 MiB
-• Stage 2 maximum shuffle read: 2.7 GiB
-
-Interpretation
-
-gen_metric_3 is one of the clearest examples that raw metric count is not a sufficient performance measure.
-
-Only 12 metrics are enough to create:
-
-• over 1.2 TiB of final-stage shuffle read
-• more than 124 GiB of memory spill
-• a 33-minute maximum task
-
-This operator should therefore not be classified as cheap simply because its metric count is small.
-
-────────
-
-8. fv4_metric_8 Is the Key Exception
-
-Configuration size
-
-fv4_metric_8 contains 25 metrics.
-
-Observed execution
-
-• Approximate runtime: ~40 minutes
-• Stage 0: approximately 11 minutes
-• Stage 1: 29 minutes
-• No heavy Stage 2
-• Stage 1 shuffle read: 1,144.3 GiB
-• Stage 1 memory spill: 4.4 GiB
-• Stage 1 disk spill: 94.7 MiB
-• Stage 1 median task: 1.2 minutes
-• Stage 1 maximum task: 14 minutes
-• Stage 1 median shuffle read: 58.4 MiB
-• Stage 1 maximum shuffle read: 195.1 MiB
-
-Interpretation
-
-fv4_metric_8 is fundamentally different from the other five operators.
-
-It completes after the first downstream stage and does not exhibit the same second-stage shuffle/spill pattern.
-
-Compared with the expensive operators, spill falls from roughly:
-
-• 124–152 GiB memory spill to 4.4 GiB
-• 7–10 GiB disk spill to only 94.7 MiB
-
-The maximum task duration also falls to 14 minutes.
-
-This makes fv4_metric_8 the most important comparison operator for Engineering / Data Science.
-
-────────
-
-9. Recurring Stage 2 Pattern Across Five Operators
-
-The following operators all produce an expensive second downstream stage:
-
-• gen_metric_1
-• gen_metric_2
-• gen_metric_3
-• fv2_metric_6
-• frdrt_metric_7
-
-Across these operators, Stage 2 consistently shows:
-
-• final shuffle read of approximately 1.2–1.37 TiB
-• memory spill of approximately 124–152 GiB
-• disk spill of approximately 7–10 GiB
-• maximum tasks of approximately 33–45 minutes
-• median shuffle partitions around 60–70 MiB
-• maximum shuffle partitions around 2.7–3.3 GiB
-
-This is a recurring execution signature rather than an isolated anomaly.
-
-Long-tail / partition imbalance
-
-Typical final-stage task:
-
-• around 45–60 seconds
-• around 60–70 MiB shuffle read
-
-Extreme task:
-
-• around 33–45 minutes
-• around 2.7–3.3 GiB shuffle read
-
-This demonstrates that a small number of tasks are receiving substantially more data than the typical task.
-
-The likely technical area to inspect is therefore the partition distribution created by metric Group By / window / aggregation logic.
-
-────────
-
-10. Metric Count Is Not a Linear Cost Predictor
-
-A simple count-based interpretation would imply that more metrics should result in proportionally more runtime.
-
-The benchmarks do not support that.
-
-Examples:
-
-• gen_metric_3: 12 metrics -> ~61 minutes
-• frdrt_metric_7: 22 metrics -> ~71 minutes
-• fv4_metric_8: 25 metrics -> only ~40 minutes
-• fv2_metric_6: 44 metrics -> ~79 minutes
-
-fv4_metric_8 contains more than twice as many metrics as gen_metric_3, yet it executes materially faster.
-
-Therefore:
-
-> **Metric design matters more than metric count alone.**
-
-The computational cost is likely driven by combinations of:
-
-• Group By key(s)
-• key cardinality / distribution
-• aggregation type
-• window length
-• amount of state maintained
-• amount of data redistributed by shuffle
-• number of metrics sharing / not sharing the same execution pattern
-
-────────
-
-11. Infrastructure Stability Observation
-
-Five of the six individual runs encountered a Stage 1 INTERNAL_ERROR_NETWORK failure before successfully retrying.
-
-This should be treated as a separate platform stability workstream.
-
-The repeated network failures create additional elapsed-time overhead and should not be interpreted as metric logic failures.
-
-For performance comparison, the successful stage attempts remain useful.
-
-For end-to-end runtime comparison, the retry overhead should be explicitly noted.
-
-────────
-
-12. Current Engineering / Data Science Problem Statement
-
-The individual operator benchmarks support the following problem statement:
-
-> **Five of the six tested Metrics operators independently generate a second shuffle-heavy stage with approximately 1.2–1.37 TiB of shuffle input, 124–152 GiB of memory spill, 7–10 GiB of disk spill and 33–45 minute task tails. `gen_metric_1` is the most expensive tested operator. `fv4_metric_8` is materially cheaper and does not generate the same heavy second stage.**
-
-The next investigation should therefore compare the metric definitions within the expensive operators against fv4_metric_8.
-
-Specifically review:
-
-• Group By keys
-• window durations
-• aggregation type
-• high-cardinality fields
-• countDistinct usage
-• long-window metrics
-• repeated / duplicate metric calculations
-• whether each metric is actually consumed downstream
-• model/business value of expensive metrics
-
-────────
-
-13. Recommended Priority
-
-Priority 1: gen_metric_1
-
-Review first because it currently has:
-
-• longest overall runtime
-• longest Stage 1
-• highest final shuffle read
-• highest final memory spill
-• highest final disk spill
-
-Priority 2: Compare gen_metric_1 with fv4_metric_8
-
-This is the highest-value structural comparison.
-
-Question:
-
-> **What grouping/window/aggregation pattern exists in `gen_metric_1` that creates the second shuffle-heavy stage, but is absent or materially different in `fv4_metric_8`?**
-
-Priority 3: Rationalise metrics by value and cost
-
-Do not remove metrics based only on count.
-
-Prioritise:
-
-> **high computational cost + low/zero downstream value**
-
-before low-cost metrics that may still be useful.
-
-────────
-
-Conclusion
-
-The individual metric-only benchmarks show that the Metrics layer is not computationally uniform.
-
-gen_metric_1 is currently the most expensive tested operator, but the broader finding is more important:
-
-> **Five operators independently reproduce the same expensive second-stage shuffle/spill pattern, while `fv4_metric_8` does not.**
-
-This indicates that the key optimisation opportunity is not simply reducing the absolute number of metrics.
-
-The stronger optimisation approach is to:
-
-1. identify the expensive metric structures,
-2. identify which of those metrics are genuinely required,
-3. remove or redesign high-cost / low-value calculations,
-4. validate the resulting lean metric population in the complete Model Plan.
-
-The upstream Map operators are deliberately excluded from these benchmarks and must be considered separately when evaluating full end-to-end Model Plan runtime.
+That is now the cleanest version because Data Science owns both the model-performance decision and the technical optimisation work.
